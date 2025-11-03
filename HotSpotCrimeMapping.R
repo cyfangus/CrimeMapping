@@ -18,32 +18,52 @@ library(fable)
 library(gganimate)
 library(gifski)
 library(magick)
+library(forecast)
+library(spatstat)
 
-# Download borough boundaries and filter for South West Basic Command Unit (SWBCU) boroughs----
+# Prepare council boundary for Kingston and Sutton boroughs----
 zip_url <- "https://data.london.gov.uk/download/38460723-837c-44ec-b9f0-1ebe939de89a/9ba8c833-6370-4b11-abdc-314aa020d5e0/statistical-gis-boundaries-london.zip"
 download.file(zip_url, destfile = "london_boundaries.zip", mode = "wb")
 unzip("london_boundaries.zip", exdir = "london_boundaries")
 shp_path <- file.path("london_boundaries", "statistical-gis-boundaries-london", "ESRI")
 
-swbcu_boroughs <- c("Richmond upon Thames", "Kingston upon Thames", "Merton", "Wandsworth") 
+target_boroughs <- c("Kingston upon Thames", "Sutton")
 
 lsoa_sf <- st_read(file.path(shp_path, "LSOA_2011_London_gen_MHW.shp"))
-lsoa_swbcu_sf <- lsoa_sf |>
-  filter(LAD11NM %in% swbcu_boroughs) |>
+lsoa_target_sf <- lsoa_sf |>
+  filter(LAD11NM %in% target_boroughs) |>
   st_transform(27700)
 
 boroughs_sf <- st_read(file.path(shp_path, "London_Borough_Excluding_MHW.shp"))
-swbcu_sf <- boroughs_sf |>
-  filter(NAME %in% swbcu_boroughs) |>
+target_sf <- boroughs_sf |>
+  filter(NAME %in% target_boroughs) |>
   st_transform(27700)
 
-swbcu_boundary <- st_union(swbcu_sf)
-swbcu_boundary_sf <- st_sf(geometry = swbcu_boundary)
+target_boundary <- st_union(target_sf)
+target_boundary_sf <- st_sf(geometry = target_boundary)
 
 unlink("london_boundaries.zip")
 unlink("london_boundaries", recursive = TRUE)
 
-# Download street-level crime data inside MPS and filter----
+# Prepare ward boundary for Kingston and Sutton boroughs----
+# API endpoint for all ward boundaries as GeoJSON
+ward_geojson_url <- "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Wards_May_2024_Boundaries_UK_BSC/FeatureServer/0/query?outFields=*&where=1%3D1&f=geojson"
+
+wards_sf <- st_read(ward_geojson_url) |>
+  st_transform(27700)
+
+wards_centroids <- wards_sf |>
+  st_make_valid() |>
+  st_centroid() |>
+  st_transform(27700)
+
+# Determine which centroids fall within borough_sf
+centroids_in_borough <- st_within(wards_centroids, target_boundary_sf, sparse = FALSE)[,1]
+
+# Filter wards where centroid is inside borough polygons
+target_wards_sf <- wards_sf[centroids_in_borough, ]
+
+# Prepare street-level crime data----
 download_dir <- tempdir()
 latest_url <- "https://data.police.uk/data/archive/latest.zip"
 latest_zip <- file.path(download_dir, "latest.zip")
@@ -83,8 +103,8 @@ extract_data <- function(month, base_dir, boundary_sf) {
   }
   
   # Convert to sf points
-  crime_sf <- st_as_sf(crime_data_clean, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
-  crime_sf <- st_transform(crime_sf, 27700)
+  crime_sf <- st_as_sf(crime_data_clean, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE) |>
+    st_transform(27700)
   
   # Spatial filter with SWBCU boundary
   crime_filtered <- st_join(crime_sf, boundary_sf, join = st_within, left = FALSE)
@@ -99,25 +119,24 @@ latest_36_months <- sort(month_folders_dates, decreasing = TRUE)[1:36]
 latest_36_months_chr <- format(latest_36_months, "%Y-%m")
 
 # Now map the function over last 12 months only
-all_swbcu_crime_sf <- map(
+crime_sf <- map(
   latest_36_months_chr,
-  possibly(~ extract_data(.x, download_dir, swbcu_boundary_sf), otherwise = NULL)) |>
+  possibly(~ extract_data(.x, download_dir, target_boundary_sf), otherwise = NULL)) |>
   compact() |>
   bind_rows()
 
-# Which types of crime should the West BCU tasking team be focused on?----
-crime_type_summary <- all_swbcu_crime_sf |>
+# Crime situation overview in the boroughs----
+crime_type_summary <- crime_sf |>
   st_drop_geometry() |>
   count(`Crime type`, name = "count")|>
   arrange(desc(count))
 
-
 # Bar chart
-crime_type_summary |>
+crime_type_summary_barchart <- crime_type_summary |>
   mutate(
     type = fct_reorder(`Crime type`, count),
     colour = case_when(
-      row_number() <= 3 ~ "red",
+      row_number() <= 2 ~ "red",
       TRUE ~ "grey40"
     )
   ) |>
@@ -126,10 +145,10 @@ crime_type_summary |>
   ) +
   geom_col() +
   geom_text(colour = "black", fontface = "bold", hjust = 0, size = 2.25) +
-  scale_x_continuous(expand = c(0, 0), limits = c(0, 60000)) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 30000)) +
   labs(
     title = str_glue(
-      "Number of Reported Crime by Types in South West BCU in the past 36 months"
+      "Number of Reported Crime by Types in Kingston and Sutton in the past 36 months"
     ),
     x = "Crime incidents count",
     y = "Crime type"
@@ -147,9 +166,45 @@ crime_type_summary |>
   ) +
   scale_fill_identity()
 
-# Which parts of the BCU should the team focus on patrolling to prevent violent and sexual crime?----
+print(crime_type_summary_barchart)
+
+# Time series visualisation----
+crime_time_series <- crime_sf |>
+  st_drop_geometry() |>
+  mutate(
+    MonthDate = lubridate::ym(Month)
+  ) |>
+  group_by(MonthDate, `Crime type`) |>
+  summarise(count = n(), .groups = 'drop') |>
+  tidyr::replace_na(list(count = 0))
+
+crime_time_series <- crime_time_series |>
+  mutate(
+    plot_group = ifelse(`Crime type` %in% c("Violence and sexual offences", "Anti-social behaviour"), "High frequency", "Other")
+  )
+
+ggplot(crime_time_series, aes(x = MonthDate, y = count, color = `Crime type`, group = `Crime type`)) +
+  geom_line(size = 1) +
+  geom_point(size = 1.3) +
+  facet_wrap(~ plot_group, scales = "free_y", ncol = 1) +
+  scale_color_viridis_d(option = "plasma") +
+  labs(
+    title = "Monthly Crime Trends by Type (Sutton & Kingston, last 36 months)",
+    subtitle = "Top crime types separated for clarity.",
+    x = "Month",
+    y = "Monthly Crime Count",
+    color = "Crime Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 15)
+  )
+
+# Mapping violent and sexual crime----
 # Isolate the violent or sexual crime data
-violent_or_sexual <- all_swbcu_crime_sf |>
+violent_or_sexual <- crime_sf |>
   filter(`Crime type` == "Violence and sexual offences") |>
   mutate(
     Month = lubridate::ym(Month),
@@ -157,127 +212,110 @@ violent_or_sexual <- all_swbcu_crime_sf |>
   ) |>
   st_transform(27700)
 
-# Calculate Gi* statistic (filter for only significant hotspot cells)
 v_or_s_gi_quarterly <- violent_or_sexual |>
   group_by(Quarter) |>
   group_modify(~ {
     .x |>
       hotspot_gistar(cell_size = 200, bandwidth_adjust = 0.25, quiet = FALSE) |>
       filter(gistar > 0, pvalue < 0.05) |>
-      st_intersection(swbcu_boundary_sf)
+      st_intersection(target_wards_sf)
   }) |>
   ungroup() |>
   st_as_sf()
 
-# Plot every quarter
-v_or_s_gi_quarterly$QuarterFactor <- factor(
-  v_or_s_gi_quarterly$Quarter,
-  levels = unique(v_or_s_gi_quarterly$Quarter[order(as.Date(paste0(substr(v_or_s_gi_quarterly$Quarter, 1, 4), "-", 
-                                                                   (as.integer(substr(v_or_s_gi_quarterly$Quarter, 7, 7)) - 1) * 3 + 1, "-01")))])
-)
+v_or_s_gi_quarterly <- v_or_s_gi_quarterly |>
+  mutate(
+    Year = as.integer(substr(Quarter, 1, 4)),
+    Qtr = as.integer(gsub(".*Q(\\d)", "\\1", Quarter)),
+    Date = make_date(Year, (Qtr - 1) * 3 + 1, 1)
+  ) |>
+  arrange(Date) |>
+  mutate(
+    QuarterFactor = factor(Quarter, levels = unique(Quarter))
+  )
 
-ggplot(v_or_s_gi_quarterly) +
+animate_quarterly_map <- ggplot(v_or_s_gi_quarterly) +
   geom_sf(aes(fill = kde), color = NA, alpha = 0.8) +
-  geom_sf(data = swbcu_boundary_sf, fill = NA, color = "black") +
-  geom_sf_text(data = swbcu_sf, aes(label = NAME), size = 3, color = "grey50") +
+  geom_sf(data = target_wards_sf, fill = NA, color = "black") +
+  geom_sf_text(data = target_wards_sf, aes(label = WD24NM), size = 3, color = "grey50") +
   scale_fill_distiller(palette = "Reds", direction = 1,
                        na.value = "white", 
                        name = "Hotspot intensity (kde)") +
-  facet_wrap(~ QuarterFactor, ncol = 4) +  # Adjust columns as needed
   theme_minimal() +
   theme(
-    strip.text = element_text(size = 10, face = "bold"),
     legend.position = "bottom",
     axis.text = element_blank(),
-    axis.ticks = element_blank()
+    axis.ticks = element_blank(),
+    plot.title = element_text(size = 14, face = "bold")
   ) +
   labs(
-    title = "Quarterly Violent or Sexual Crime Hotspot Maps",
+    title = "Violent or Sexual Crime Hotspot Maps: {closest_state}",
     subtitle = "Gi* statistic significant hotspots by quarter",
     caption = "Note: Only significant hotspots shown"
-  )
-
-
-# SARIMA for six-month prediction per grid----
-v_or_s_gi_quarterly <- v_or_s_gi_quarterly |>
-  mutate(grid_id = as.character(st_geometry(v_or_s_gi_quarterly)))
-
-grid_geom <- v_or_s_gi_quarterly |>
-  select(grid_id, geometry) |>
-  distinct(grid_id, .keep_all = TRUE)
-
-# Aggregate kde per grid_id per Month
-hotspot_tsibble <- v_or_s_gi_quarterly |>
-  st_drop_geometry() |>
-  select(grid_id, Quarter, kde) |>
-  group_by(grid_id, Quarter) |>
-  summarise(kde = mean(kde, na.rm=TRUE), .groups = "drop") |>
-  filter(!is.na(kde)) |>
-  mutate(QuarterDate = as.Date(paste0(substr(Quarter, 1, 4), "-", 
-                                      (as.integer(substr(Quarter, 7,7)) - 1) * 3 + 1, "-01"))) |>
-  mutate(Quarter = yearquarter(QuarterDate)) |>
-  as_tsibble(index = Quarter, key = grid_id) |>
-  fill_gaps(kde = 0)
-
-# Fit SARIMA model (or other) per grid_id
-handlers("progress")
-with_progress({
-  models <- hotspot_tsibble |>
-    model(ARIMA(kde))
-})
-
-  # Forecast 4 quarters ahead for each grid_id
-forecasts <- models |>
-  forecast(h = 4)
-
-# Get the name of the index column (likely "Quarter" or "QuarterDate")
-index_col <- index_var(hotspot_tsibble)
-
-# Extract the last observation's time value from the index column
-last_obs_quarter <- hotspot_tsibble |>
-  slice_max(!!sym(index_col), n = 1) |>
-  pull(!!sym(index_col)) |>
-  max()
-
-# Generate next 4 quarters dates
-upcoming_quarters <- seq(from = as.Date(format(last_obs_quarter, "%Y-%m-01")) + 90, length.out = 4, by = "quarter")
-
-# Combine forecasts with spatial grid polygons for mapping and filter to next 4 quarters only
-grid_sf_with_forecast <- forecasts |>
-  as_tibble() |>
-  filter(Quarter > max(hotspot_tsibble$Quarter)) |>
-  left_join(grid_geom, by = "grid_id") |>
-  st_as_sf() |>
-  mutate(
-    QuarterLabel = paste0(year(Quarter), " Q", quarter(Quarter)),
-    QuarterFactor = factor(QuarterLabel, levels = unique(QuarterLabel[order(Quarter)]))
-  )
-
-# Simplify geometry for faster plotting
-grid_sf_with_forecast_simple <- st_simplify(grid_sf_with_forecast, dTolerance = 100)
-
-# Plot forecasted 4 upcoming quarters only
-ggplot(grid_sf_with_forecast) +
-  geom_sf(aes(fill = .mean), color = NA, alpha = 0.8) +
-  geom_sf(data = swbcu_boundary_sf, fill = NA, color = "grey50") +
-  geom_sf_text(data = swbcu_sf, aes(label = NAME), size = 3, color = "grey50") +
-  scale_fill_gradient(
-    low = "gray90",   # very light grey for low intensity
-    high = "darkred", # deep red for high intensity
-    na.value = "white",
-    name = "Predicted Hotspot Intensity"
   ) +
-  facet_wrap(~ QuarterFactor, ncol = 4) +
+  transition_states(Quarter, transition_length = 2, state_length = 1, wrap = FALSE) +
+  ease_aes('linear')
+
+animate(animate_quarterly_map,
+        nframes = length(unique(v_or_s_gi_quarterly$Quarter)) * 10,
+        fps = 5,
+        width = 800, height = 600)
+
+anim_save("quarterly_crime_hotspots.gif")
+
+
+# Total crime counts across all types by month
+total_crime_ts <- crime_time_series %>%
+  group_by(MonthDate) %>%
+  summarise(total_count = sum(count))
+
+ggplot(total_crime_ts, aes(x = MonthDate, y = total_count)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  labs(title = "Monthly Crime Counts Over Time",
+       x = "Month",
+       y = "Crime Count") +
+  theme_minimal()
+
+# Crime situation overview by wards----
+crime_by_wards <- st_join(crime_sf, target_wards_sf["WD24NM"], left = TRUE) |>
+  st_drop_geometry() |>
+  group_by(WD24NM) |>
+  summarise(count = n()) |>
+  arrange(desc(count))
+
+crime_by_wards_barchart <- head(crime_by_wards, 20) |>
+  mutate(
+    type = fct_reorder(`WD24NM`, count),
+    colour = case_when(
+      row_number() <= 2 ~ "red",
+      TRUE ~ "grey40"
+    )
+  ) |> 
+  ggplot(
+    aes(x = count, y = type, fill = colour, label = count)
+  ) +
+  geom_col() +
+  geom_text(colour = "black", fontface = "bold", hjust = 0, size = 2.25) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 15000)) +
+  labs(
+    title = str_glue(
+      "Top 20 Wards by Crime Counts in the past 36 months"
+    ),
+    x = "Crime incidents count",
+    y = "Wards"
+  ) +
   theme_minimal() +
   theme(
-    strip.text = element_text(size = 10, face = "bold"),
-    legend.position = "bottom",
-    axis.text = element_blank(),
-    axis.ticks = element_blank()
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title = element_text(
+      colour = "grey30",
+      face = "bold",
+      size = 13
+    )
   ) +
-  labs(
-    title = "Predicted Violent or Sexual Crime Hotspots for Next Year",
-    subtitle = "Forecasted kernel density estimates from SARIMA models",
-    caption = "Note: Hotspots predicted spatially per grid cell"
-  )
+  scale_fill_identity()
 
+print(crime_by_wards_barchart)
