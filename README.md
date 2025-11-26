@@ -6,19 +6,19 @@ Traditional policing relies on "crime counts" (volume). However, this is ineffic
 
 ✅ The Solution
 
-This project implements a Harm-Weighted Hotspot Analysis (based on the Cambridge Crime Harm Index methodology). By weighing crimes by their sentencing severity, we identify areas of high victimization cost r\ather than just high activity.
+This project implements a Harm-Weighted Hotspot Analysis using the National Crime Harm Index (NCHI) methodology. Instead of simple counts, crimes are weighted by their judicial severity (average custodial days). This methodology ensures that hotspots represent areas of high victimization cost and true police priority, not just high foot traffic.
 
 🛠️ Tech Stack
 
 R: Data cleaning & transformation (dplyr, lubridate)
 
-Geospatial: Spatial joins and kernel density estimation (sf, tmap)
+Geospatial: Spatial joins and interactive mapping (sf, leaflet)
 
-Visualization: Time-series decomposition of crime trends (ggplot2)
+Visualization: Time-series decomposition of crime trends (ggplot2, viridis)
 
 📊 Key Insights
 
-Westminster has the highest volume of crime, but Lambeth shows a higher density of harm-weighted violent offenses during weekends.
+Volume vs. Harm: Anti-social behaviour often dominates raw volume counts, but Robbery and Violence and Sexual Offences generate the highest Harm Scores (average custodial days), shifting strategic focus away from simple noise complaints.
 
 Seasonality: Property crime spikes in Q4 (Winter), whereas violent crime peaks in Q3 (Summer).
 
