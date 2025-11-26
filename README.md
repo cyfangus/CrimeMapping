@@ -10,15 +10,19 @@ This project implements a Harm-Weighted Hotspot Analysis using the National Crim
 
 🛠️ Tech Stack
 
-R: Data cleaning & transformation (dplyr, lubridate)
+R: Data cleaning & transformation (dplyr, lubridate, tsibble)
 
 Geospatial: Spatial joins and interactive mapping (sf, leaflet)
+
+Machine Learning: Time Series Forecasting (fable, feasts, forecast)
 
 Visualization: Time-series decomposition of crime trends (ggplot2, viridis)
 
 📊 Key Insights
 
 Volume vs. Harm: Anti-social behaviour often dominates raw volume counts, but Robbery and Violence and Sexual Offences generate the highest Harm Scores (average custodial days), shifting strategic focus away from simple noise complaints.
+
+Predictive Policing: An ETS model is applied to the monthly aggregate harm score to forecast future trends. This provides an actionable 12-month outlook for resource pre-allocation.
 
 Seasonality: Property crime spikes in Q4 (Winter), whereas violent crime peaks in Q3 (Summer).
 
